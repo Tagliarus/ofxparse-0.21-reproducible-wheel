@@ -1,0 +1,1199 @@
+name: ofxparse 0.21 reproducible wheel
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/phase83-ofxparse-wheel.yml
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    outputs:
+      bundle_chunk_count: ${{ steps.build.outputs.bundle_chunk_count }}
+      bundle_sha256: ${{ steps.build.outputs.bundle_sha256 }}
+      bundle_size: ${{ steps.build.outputs.bundle_size }}
+      bundle_b64_0: ${{ steps.build.outputs.bundle_b64_0 }}
+      bundle_b64_1: ${{ steps.build.outputs.bundle_b64_1 }}
+      bundle_b64_2: ${{ steps.build.outputs.bundle_b64_2 }}
+      bundle_b64_3: ${{ steps.build.outputs.bundle_b64_3 }}
+    steps:
+      - name: Verify inputs and build twice in isolated Docker containers
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import email.parser
+          import hashlib
+          import io
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import socket
+          import stat
+          import subprocess
+          import sys
+          import tarfile
+          import tempfile
+          import urllib.request
+          import venv
+          import zipfile
+
+          ROOT = Path(os.environ["RUNNER_TEMP"]) / "phase83"
+          INPUT = ROOT / "input"
+          TOOLS = ROOT / "toolchain"
+          WORK = ROOT / "work"
+          OUT = ROOT / "out"
+          ARTIFACT = ROOT / "artifact"
+          IMAGE_TAG = "python:3.11.9-slim-bookworm"
+          MAX_WHEEL_BYTES = 2 * 1024 * 1024
+          BUNDLE_MAX_BYTES = 196608
+          BUNDLE_CHUNK_BYTES = 65536
+          BUNDLE_CHUNK_COUNT = 4
+          GITHUB_ENV_STRING_LIMIT_BYTES = 131072
+          GITHUB_JOB_OUTPUT_LIMIT_BYTES = 1000000
+          GITHUB_JOB_OUTPUT_RESERVE_BYTES = 8192
+          MAX_WHEEL_MEMBERS = 512
+          MAX_WHEEL_UNCOMPRESSED_BYTES = 5 * 1024 * 1024
+          SOURCE = {
+              "name": "ofxparse-0.21.tar.gz",
+              "url": "https://files.pythonhosted.org/packages/45/ae/98a2acfd06d15869c4b1be7fb74849c8a67cf15b65181f1fe879547e7494/ofxparse-0.21.tar.gz",
+              "size": 53837,
+              "sha256": "057ab68d31270dece4d1a47662096aa76341968aaee145ffc711cb44cbd5c4a7",
+          }
+          BUILD_TOOLS = [
+              {"name": "pip", "version": "26.3", "filename": "pip-26.3-py3-none-any.whl", "size": 1950951,
+               "sha256": "f3b60b20ffaadd4415ed7957212a38ac63fa4c5fa375bd0f4a797777940fad13",
+               "url": "https://files.pythonhosted.org/packages/07/25/ee8c38ae72d66b844ce8eb9711ba905dba21ca1a8a0c960057c41cd23337/pip-26.3-py3-none-any.whl"},
+              {"name": "setuptools", "version": "84.2.1", "filename": "setuptools-84.2.1-py3-none-any.whl", "size": 876263,
+               "sha256": "ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2",
+               "url": "https://files.pythonhosted.org/packages/ef/55/6dc6d6bb953bdfc52519a0059592c52b6e3b8ad51cf8256dffceb55b0610/setuptools-84.2.1-py3-none-any.whl"},
+          ]
+          EPOCH = 1783123200
+          EXPECTED_PROBES = (
+              "container_config_verified", "uid_non_root", "capabilities_zero", "no_new_privs",
+              "readonly_rootfs", "input_readonly", "runtime_readonly", "toolchain_readonly",
+              "work_write", "out_write", "loopback_positive", "external_tcp_parent_denied",
+              "external_tcp_child_denied", "input_write_denied", "input_chmod_denied",
+              "runtime_write_denied", "runtime_chmod_denied", "toolchain_write_denied",
+              "toolchain_chmod_denied", "host_cwd_inaccessible", "host_sentinel_inaccessible",
+              "host_fd_inaccessible", "private_pid_namespace", "private_mount_namespace",
+              "docker_socket_absent", "host_proc_absent", "pip_check", "source_unchanged",
+          )
+
+          def run(argv, *, capture=True):
+              result = subprocess.run(argv, check=False, text=True, capture_output=capture)
+              if result.returncode:
+                  detail = result.stderr[-2000:] if capture else ""
+                  raise RuntimeError(f"command_failed:{argv[0]}:{result.returncode}:{detail}")
+              return result.stdout if capture else ""
+
+          def validate_output_budget(values):
+              utf16_bytes = 0
+              for name, value in values.items():
+                  if not isinstance(name, str) or not name.isascii() or not isinstance(value, str) or not value.isascii():
+                      raise RuntimeError("public_bundle_output_not_ascii")
+                  if len((name + "=" + value).encode("ascii")) >= GITHUB_ENV_STRING_LIMIT_BYTES:
+                      raise RuntimeError("public_bundle_output_value_limit_exceeded")
+                  utf16_bytes += len((name + "=" + value + "\n").encode("utf-16-le"))
+              if utf16_bytes + GITHUB_JOB_OUTPUT_RESERVE_BYTES >= GITHUB_JOB_OUTPUT_LIMIT_BYTES:
+                  raise RuntimeError("public_bundle_job_output_limit_exceeded")
+              return utf16_bytes
+
+          def validate_bundle_output(values, expected_payload):
+              expected_names = {
+                  "bundle_chunk_count", "bundle_size", "bundle_sha256",
+                  *(f"bundle_b64_{index}" for index in range(BUNDLE_CHUNK_COUNT)),
+              }
+              if not isinstance(values, dict) or set(values) != expected_names:
+                  raise RuntimeError("public_bundle_output_fields_invalid")
+              validate_output_budget(values)
+              count_text = values["bundle_chunk_count"]
+              size_text = values["bundle_size"]
+              digest = values["bundle_sha256"]
+              if not isinstance(count_text, str) or not re.fullmatch(r"[1-4]", count_text):
+                  raise RuntimeError("public_bundle_chunk_count_invalid")
+              if (not isinstance(size_text, str) or not re.fullmatch(r"[1-9][0-9]{0,5}", size_text)
+                      or int(size_text) > BUNDLE_MAX_BYTES):
+                  raise RuntimeError("public_bundle_size_invalid")
+              if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                  raise RuntimeError("public_bundle_sha256_invalid")
+              count = int(count_text)
+              pieces = []
+              for index in range(BUNDLE_CHUNK_COUNT):
+                  chunk = values[f"bundle_b64_{index}"]
+                  if not isinstance(chunk, str) or not chunk.isascii() or any(character.isspace() for character in chunk):
+                      raise RuntimeError("public_bundle_chunk_invalid")
+                  if len(chunk) > BUNDLE_CHUNK_BYTES:
+                      raise RuntimeError("public_bundle_chunk_size_invalid")
+                  if index < count:
+                      if not chunk:
+                          raise RuntimeError("public_bundle_chunk_missing")
+                      pieces.append(chunk)
+                  elif chunk:
+                      raise RuntimeError("public_bundle_trailing_chunk_nonempty")
+              encoded = "".join(pieces)
+              try:
+                  payload = base64.b64decode(encoded, validate=True)
+              except (ValueError, base64.binascii.Error):
+                  raise RuntimeError("public_bundle_base64_invalid") from None
+              if (base64.b64encode(payload).decode("ascii") != encoded or len(payload) != int(size_text)
+                      or hashlib.sha256(payload).hexdigest() != digest or payload != expected_payload):
+                  raise RuntimeError("public_bundle_output_integrity_mismatch")
+              return payload
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def read_verified_wheel_directory(directory, expected_name):
+              """Read one allowlisted regular wheel without following a backend link."""
+              directory = Path(directory)
+              before = directory.lstat()
+              if not stat.S_ISDIR(before.st_mode):
+                  raise RuntimeError("output_root_not_directory")
+              directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+              try:
+                  opened_directory = os.fstat(directory_fd)
+                  if (opened_directory.st_dev, opened_directory.st_ino) != (before.st_dev, before.st_ino):
+                      raise RuntimeError("output_root_changed")
+
+                  def checked_entry():
+                      with os.scandir(directory_fd) as entries:
+                          rows = list(entries)
+                      if [entry.name for entry in rows] != [expected_name]:
+                          raise RuntimeError("unexpected_wheel_output_tree")
+                      entry = rows[0]
+                      observed = entry.stat(follow_symlinks=False)
+                      if (not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1
+                              or observed.st_size <= 0 or observed.st_size > MAX_WHEEL_BYTES):
+                          raise RuntimeError("wheel_output_not_single_regular_file")
+                      return observed
+
+                  observed = checked_entry()
+                  wheel_fd = os.open(expected_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd)
+                  try:
+                      opened = os.fstat(wheel_fd)
+                      if (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink) != (
+                          observed.st_dev, observed.st_ino, observed.st_mode, 1
+                      ) or not stat.S_ISREG(opened.st_mode):
+                          raise RuntimeError("wheel_output_changed_or_not_regular")
+                      with os.fdopen(wheel_fd, "rb", closefd=False) as stream:
+                          payload = stream.read(MAX_WHEEL_BYTES + 1)
+                      if len(payload) != opened.st_size or len(payload) > MAX_WHEEL_BYTES:
+                          raise RuntimeError("wheel_output_size_changed_or_exceeded_limit")
+                  finally:
+                      os.close(wheel_fd)
+                  final = checked_entry()
+                  if (final.st_dev, final.st_ino) != (observed.st_dev, observed.st_ino):
+                      raise RuntimeError("wheel_output_changed_after_read")
+                  return payload
+              finally:
+                  os.close(directory_fd)
+
+          def validate_artifact_tree(directory, expected_files):
+              """Fail closed if staging contains links, special files, or extra paths."""
+              root = Path(directory)
+              root_stat = root.lstat()
+              if not stat.S_ISDIR(root_stat.st_mode):
+                  raise RuntimeError("artifact_root_not_directory")
+              found = set()
+              found_directories = set()
+              pending = [(root, "")]
+              while pending:
+                  parent, relative = pending.pop()
+                  with os.scandir(parent) as entries:
+                      rows = list(entries)
+                  for entry in rows:
+                      child_relative = f"{relative}/{entry.name}" if relative else entry.name
+                      child_stat = entry.stat(follow_symlinks=False)
+                      if stat.S_ISDIR(child_stat.st_mode):
+                          found_directories.add(child_relative)
+                          pending.append((Path(entry.path), child_relative))
+                      elif stat.S_ISREG(child_stat.st_mode) and child_stat.st_nlink == 1:
+                          found.add(child_relative)
+                      else:
+                          raise RuntimeError("artifact_contains_link_or_special_file")
+              if found != set(expected_files):
+                  raise RuntimeError("artifact_allowlist_mismatch")
+              expected_directories = {"build-1", "build-2"} if any(path.startswith("build-") for path in expected_files) else set()
+              if found_directories != expected_directories:
+                  raise RuntimeError("artifact_directory_allowlist_mismatch")
+
+          for path in (INPUT, TOOLS, WORK, OUT, ARTIFACT):
+              path.mkdir(parents=True, exist_ok=True)
+
+          github_repository = os.environ.get("GITHUB_REPOSITORY", "")
+          github_ref = os.environ.get("GITHUB_REF", "")
+          github_sha = os.environ.get("GITHUB_SHA", "").casefold()
+          github_workflow_ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
+          raw_run_id = os.environ.get("GITHUB_RUN_ID", "")
+          runner_os = os.environ.get("RUNNER_OS", "")
+          runner_image_os = os.environ.get("ImageOS", "")
+          runner_image_version = os.environ.get("ImageVersion", "")
+          def verify_initial_push_commit():
+              event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+              event_path = os.environ.get("GITHUB_EVENT_PATH", "")
+              if event_name != "push" or not event_path:
+                  raise RuntimeError("initial_push_event_missing")
+              try:
+                  event = json.loads(Path(event_path).read_text(encoding="utf-8"))
+              except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                  raise RuntimeError("initial_push_event_invalid") from None
+              repository = event.get("repository", {}).get("full_name") if isinstance(event, dict) else None
+              before = event.get("before") if isinstance(event, dict) else None
+              after = event.get("after") if isinstance(event, dict) else None
+              if (repository != "Tagliarus/ofxparse-0.21-reproducible-wheel"
+                      or event.get("ref") != "refs/heads/main"
+                      or before != "0" * 40 or after != github_sha):
+                  raise RuntimeError("initial_push_event_identity_invalid")
+              commits = event.get("commits")
+              if (not isinstance(commits, list) or len(commits) != 1
+                      or not isinstance(commits[0], dict) or commits[0].get("id") != github_sha):
+                  raise RuntimeError("initial_push_commit_list_invalid")
+              def get_public_api_object(path):
+                  request = urllib.request.Request(
+                      "https://api.github.com" + path,
+                      headers={"Accept": "application/vnd.github+json", "User-Agent": "ofxparse-0.21-reproducible-wheel",
+                               "X-GitHub-Api-Version": "2022-11-28"},
+                  )
+                  try:
+                      with urllib.request.urlopen(request, timeout=20) as response:
+                          return json.loads(response.read(256 * 1024).decode("utf-8"))
+                  except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                      raise RuntimeError("initial_push_public_api_unavailable_or_invalid") from None
+              repository_info = get_public_api_object("/repos/Tagliarus/ofxparse-0.21-reproducible-wheel")
+              if (not isinstance(repository_info, dict)
+                      or repository_info.get("full_name") != "Tagliarus/ofxparse-0.21-reproducible-wheel"
+                      or repository_info.get("private") is not False
+                      or repository_info.get("visibility") != "public"
+                      or repository_info.get("default_branch") != "main"):
+                  raise RuntimeError("initial_push_repository_api_identity_invalid")
+              commit = get_public_api_object(
+                  "/repos/Tagliarus/ofxparse-0.21-reproducible-wheel/commits/" + github_sha)
+              expected_paths = {"README.md", ".github/workflows/phase83-ofxparse-wheel.yml"}
+              files = commit.get("files") if isinstance(commit, dict) else None
+              parents = commit.get("parents") if isinstance(commit, dict) else None
+              observed = {row.get("filename") for row in files if isinstance(row, dict)} if isinstance(files, list) else set()
+              if (commit.get("sha") != github_sha or parents != [] or not isinstance(files, list)
+                      or len(files) != len(expected_paths) or observed != expected_paths
+                      or any(row.get("status") != "added" for row in files if isinstance(row, dict))):
+                  raise RuntimeError("initial_push_api_commit_tree_mismatch")
+
+          if (github_repository != "Tagliarus/ofxparse-0.21-reproducible-wheel" or github_ref != "refs/heads/main"
+                  or not re.fullmatch(r"[0-9a-f]{40}", github_sha)
+                  or github_workflow_ref != f"{github_repository}/.github/workflows/phase83-ofxparse-wheel.yml@{github_ref}"
+                  or not raw_run_id.isdecimal() or str(int(raw_run_id)) != raw_run_id or int(raw_run_id) <= 0
+                  or runner_os != "Linux" or not runner_image_os or not runner_image_version):
+              raise RuntimeError("runner_or_workflow_identity_invalid")
+          verify_initial_push_commit()
+
+          # Resolve the official image digest before any source or tool input is fetched.
+          run(["docker", "pull", IMAGE_TAG])
+          image_rows = json.loads(run(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", IMAGE_TAG]))
+          image_ref = next((item for item in image_rows if item.startswith("python@sha256:") or item.startswith("docker.io/library/python@sha256:")), None)
+          if not image_ref or "@sha256:" not in image_ref:
+              raise RuntimeError("official_python_image_digest_missing")
+          image_digest = image_ref.rsplit("@", 1)[1]
+          if len(image_digest) != 71 or not image_digest.startswith("sha256:"):
+              raise RuntimeError("official_python_image_digest_invalid")
+          image = "python@" + image_digest
+          docker_server_version = run(["docker", "version", "--format", "{{.Server.Version}}"])
+
+          def fetch(item, destination):
+              request = urllib.request.Request(item["url"], headers={"User-Agent": "ofxparse-0.21-wheel/1"})
+              with urllib.request.urlopen(request, timeout=45) as response:
+                  if response.geturl() != item["url"]:
+                      raise RuntimeError("unexpected_artifact_redirect")
+                  payload = response.read(item["size"] + 1)
+              if len(payload) != item["size"] or hashlib.sha256(payload).hexdigest() != item["sha256"]:
+                  raise RuntimeError(f"artifact_hash_or_size_mismatch:{item['name']}")
+              destination.write_bytes(payload)
+
+          fetch(SOURCE, INPUT / SOURCE["name"])
+          for item in BUILD_TOOLS:
+              fetch(item, INPUT / item["filename"])
+          source_before = sha256(INPUT / SOURCE["name"])
+          tools_evidence = [{**item, "bytes_verified": True} for item in BUILD_TOOLS]
+
+          # A trusted setup container creates a no-pip venv and installs only the
+          # two hash-checked offline wheels. Package source is not executed here.
+          toolchain_owner = (os.getuid(), os.getgid())
+          setup_code = r'''import json, os, subprocess, sys, venv
+          root = "/toolchain"
+          envdir = root + "/venv"
+          home = root + "/home"
+          temporary = root + "/tmp"
+          os.makedirs(home, exist_ok=True)
+          os.makedirs(temporary, exist_ok=True)
+          venv.create(envdir, with_pip=False)
+          interpreter = envdir + "/bin/python"
+          purelib = envdir + "/lib/python3.11/site-packages"
+          os.makedirs(purelib, exist_ok=True)
+          wheels = ["/input/pip-26.3-py3-none-any.whl", "/input/setuptools-84.2.1-py3-none-any.whl"]
+          install_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": home, "TMPDIR": temporary,
+                         "PYTHONPATH": wheels[0], "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1",
+                         "PIP_CONFIG_FILE": "/dev/null", "PIP_NO_INDEX": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
+          def bounded_output(value):
+              text = "" if value is None else str(value)
+              text = "".join(character if character.isprintable() else " " for character in text)
+              suffix = "...[truncated]"
+              return text if len(text) <= 256 else text[-(256 - len(suffix)):] + suffix
+          def run_setup_subprocess(phase, command, env):
+              try:
+                  result = subprocess.run(command, env=env, check=False, capture_output=True, text=True)
+              except OSError as error:
+                  diagnostic = {"phase": phase, "executable": command[0], "exit_code": None,
+                                "stdout": "", "stderr": bounded_output(error)}
+                  raise RuntimeError("setup_subprocess_failed:" + json.dumps(diagnostic, sort_keys=True)) from error
+              if result.returncode:
+                  diagnostic = {"phase": phase, "executable": command[0], "exit_code": result.returncode,
+                                "stdout": bounded_output(result.stdout), "stderr": bounded_output(result.stderr)}
+                  raise RuntimeError("setup_subprocess_failed:" + json.dumps(diagnostic, sort_keys=True))
+              return result
+          command = [interpreter, "-m", "pip", "install", "--no-index", "--ignore-installed", "--disable-pip-version-check", "--target", purelib, *wheels]
+          run_setup_subprocess("install_offline_build_tools", command, install_env)
+          check_env = {"PATH": envdir + "/bin:/usr/local/bin:/usr/bin:/bin", "HOME": home, "TMPDIR": temporary,
+                       "PYTHONPATH": purelib, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1",
+                       "PIP_CONFIG_FILE": "/dev/null", "PIP_NO_INDEX": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
+          result = run_setup_subprocess("pip_check", [interpreter, "-m", "pip", "check"], check_env)
+          metadata_code = "import json,importlib.metadata; print(json.dumps({'pip':importlib.metadata.version('pip'),'setuptools':importlib.metadata.version('setuptools')}))"
+          versions = run_setup_subprocess("verify_tool_versions", [interpreter, "-c", metadata_code], check_env)
+          installed = json.loads(versions.stdout)
+          if installed != {"pip": "26.3", "setuptools": "84.2.1"}:
+              raise RuntimeError("pinned_tool_versions_mismatch")
+          pip_import_code = "import pip; print(pip.__version__)"
+          pip_runtime = run_setup_subprocess("verify_pip_runtime_import", [interpreter, "-c", pip_import_code], check_env)
+          if pip_runtime.stdout.strip() != installed["pip"]:
+              raise RuntimeError("pinned_pip_runtime_mismatch")
+          setuptools_backend_code = "import setuptools; import setuptools.build_meta; from setuptools.command.bdist_wheel import bdist_wheel; print(setuptools.__version__)"
+          setuptools_backend = run_setup_subprocess("verify_setuptools_backend_import", [interpreter, "-c", setuptools_backend_code], check_env)
+          if setuptools_backend.stdout.strip() != installed["setuptools"]:
+              raise RuntimeError("pinned_setuptools_backend_mismatch")
+          print(json.dumps({"python": sys.version.split()[0], **installed, "pip_check": "clean",
+                            "install_network": "none", "install_requires_hash_verified_input": True}, sort_keys=True))
+          '''
+          setup_command = ["docker", "run", "--rm", "--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                           "--user", f"{toolchain_owner[0]}:{toolchain_owner[1]}",
+                           "--mount", f"type=bind,source={INPUT},target=/input,readonly",
+                           "--mount", f"type=bind,source={TOOLS},target=/toolchain",
+                           image, "/usr/local/bin/python", "-c", setup_code]
+          setup_result = json.loads(run(setup_command))
+          if setup_result.get("pip_check") != "clean" or setup_result.get("python") != "3.11.9":
+              raise RuntimeError("isolated_toolchain_setup_not_verified")
+
+          build_wrapper_source = r'''import hashlib, json, os, pathlib, socket, stat, subprocess, sys, uuid
+          IN_CONTAINER_RESULTS = ("uid_non_root", "capabilities_zero", "no_new_privs", "readonly_rootfs",
+              "input_readonly", "runtime_readonly", "toolchain_readonly", "work_write", "out_write",
+              "loopback_positive", "external_tcp_parent_denied", "external_tcp_child_denied", "input_write_denied",
+              "input_chmod_denied", "runtime_write_denied", "runtime_chmod_denied", "toolchain_write_denied",
+              "toolchain_chmod_denied", "host_cwd_inaccessible", "host_sentinel_inaccessible", "host_fd_inaccessible",
+              "private_pid_namespace", "private_mount_namespace", "docker_socket_absent", "host_proc_absent")
+          def write_ok(directory):
+              path = pathlib.Path(directory) / (".phase83-" + uuid.uuid4().hex)
+              path.write_bytes(b"ok"); path.unlink(); return "passed"
+          def denied_write(path):
+              try:
+                  with open(path, "ab"): pass
+              except OSError: return "passed"
+              return "failed"
+          def denied_chmod(path):
+              try: os.chmod(path, stat.S_IMODE(os.stat(path).st_mode))
+              except OSError: return "passed"
+              return "failed"
+          def external_denied():
+              try: socket.create_connection(("1.1.1.1", 443), timeout=2).close()
+              except OSError: return "passed"
+              return "failed"
+          def loopback_ok():
+              server = socket.socket(); server.bind(("127.0.0.1", 0)); server.listen(1)
+              client = socket.socket(); client.settimeout(2); client.connect(server.getsockname())
+              peer, _ = server.accept(); peer.close(); client.close(); server.close(); return "passed"
+          def mount_options(target):
+              matches = []
+              for line in pathlib.Path("/proc/self/mountinfo").read_text().splitlines():
+                  parts = line.split()
+                  mountpoint = parts[4].replace("\\040", " ")
+                  if target == mountpoint or target.startswith(mountpoint.rstrip("/") + "/"):
+                      matches.append((len(mountpoint), set(parts[5].split(","))))
+              return max(matches, default=(0, set()), key=lambda row: row[0])[1]
+          def collect_probe_results(host_pid, host_pid_ns, host_mnt_ns, host_fd, host_cwd, host_sentinel):
+              status = pathlib.Path("/proc/self/status").read_text()
+              fields = {line.split(":", 1)[0]: line.split(":", 1)[1].strip() for line in status.splitlines() if ":" in line}
+              caps = all(int(fields.get(key, "-1"), 16) == 0 for key in ("CapEff", "CapPrm", "CapInh", "CapAmb", "CapBnd"))
+              capability_sets = {key: fields.get(key, "") for key in ("CapEff", "CapPrm", "CapInh", "CapAmb", "CapBnd")}
+              pid_ns = os.stat("/proc/self/ns/pid").st_ino; mnt_ns = os.stat("/proc/self/ns/mnt").st_ino
+              child = subprocess.run([sys.executable, "-c", "import socket,sys;\ntry: socket.create_connection(('1.1.1.1',443),timeout=2); raise SystemExit(9)\nexcept OSError: raise SystemExit(0)"], check=False, capture_output=True)
+              pip_check = subprocess.run([sys.executable, "-m", "pip", "check"], check=False, capture_output=True, text=True)
+              pip_ok = pip_check.returncode == 0 and pip_check.stdout.strip() in {"No broken requirements found.", "No broken requirements found"}
+              return {
+                  "effective_uid": os.geteuid(), "effective_gid": os.getegid(), "capability_sets": capability_sets,
+                  "no_new_privs_value": int(fields.get("NoNewPrivs", "-1")), "namespace_inodes": {"pid": pid_ns, "mount": mnt_ns},
+                  "mount_options": {path: sorted(mount_options(path)) for path in ("/", "/input", "/usr/local/bin/python", "/toolchain", "/work", "/out")},
+                  "uid_non_root": "passed" if os.geteuid() != 0 else "failed", "capabilities_zero": "passed" if caps else "failed",
+                  "no_new_privs": "passed" if fields.get("NoNewPrivs") == "1" else "failed",
+                  "readonly_rootfs": "passed" if "ro" in mount_options("/") else "failed",
+                  "input_readonly": "passed" if "ro" in mount_options("/input") else "failed",
+                  "runtime_readonly": "passed" if "ro" in mount_options("/usr/local/bin/python") else "failed",
+                  "toolchain_readonly": "passed" if "ro" in mount_options("/toolchain") else "failed",
+                  "work_write": write_ok("/work"), "out_write": write_ok("/out"), "loopback_positive": loopback_ok(),
+                  "external_tcp_parent_denied": external_denied(), "external_tcp_child_denied": "passed" if child.returncode == 0 else "failed",
+                  "input_write_denied": denied_write("/input/ofxparse-0.21.tar.gz"), "input_chmod_denied": denied_chmod("/input/ofxparse-0.21.tar.gz"),
+                  "runtime_write_denied": denied_write("/usr/local/bin/python"), "runtime_chmod_denied": denied_chmod("/usr/local/bin/python"),
+                  "toolchain_write_denied": denied_write("/toolchain/venv/bin/python"), "toolchain_chmod_denied": denied_chmod("/toolchain/venv/bin/python"),
+                  "host_cwd_inaccessible": "passed" if not os.path.exists(host_cwd) else "failed",
+                  "host_sentinel_inaccessible": "passed" if not os.path.exists(host_sentinel) else "failed",
+                  "host_fd_inaccessible": "passed" if not os.path.exists(f"/proc/{host_pid}/fd/{host_fd}") else "failed",
+                  "private_pid_namespace": "passed" if pid_ns != int(host_pid_ns) else "failed",
+                  "private_mount_namespace": "passed" if mnt_ns != int(host_mnt_ns) else "failed",
+                  "docker_socket_absent": "passed" if not os.path.exists("/var/run" + "/docker.sock") else "failed",
+                  "host_proc_absent": "passed" if not os.path.exists("/host" + "/proc") else "failed",
+                  "pip_check": "clean" if pip_ok else "failed",
+                  "source_sha256": hashlib.sha256(pathlib.Path("/input/ofxparse-0.21.tar.gz").read_bytes()).hexdigest(),
+              }
+          def gate_and_exec_build(results, container_name, command, env):
+              if any(results.get(key) != "passed" for key in IN_CONTAINER_RESULTS) or results.get("pip_check") != "clean":
+                  raise RuntimeError("trusted_probe_gate_failed")
+              if not command or not os.path.isabs(command[0]): raise RuntimeError("backend_command_invalid")
+              results = dict(results, phase="before_backend_exec", container_name=container_name, process_pid=os.getpid())
+              print(json.dumps(results, sort_keys=True), flush=True)
+              os.execve(command[0], command, env)
+          def main():
+              if len(sys.argv) < 10 or sys.argv[8] != "--": raise RuntimeError("trusted_wrapper_arguments_invalid")
+              container_name = sys.argv[1]
+              results = collect_probe_results(*sys.argv[2:8])
+              if results.get("source_sha256") != os.environ.get("PHASE83_SOURCE_SHA256"):
+                  raise RuntimeError("probe_source_hash_mismatch")
+              gate_and_exec_build(results, container_name, sys.argv[9:], os.environ.copy())
+          if __name__ == "__main__": main()
+          '''
+          wrapper_file = INPUT / "trusted-build-wrapper.py"
+          wrapper_file.write_text(build_wrapper_source, encoding="utf-8")
+          host_pid_ns = os.stat("/proc/self/ns/pid").st_ino
+          host_mnt_ns = os.stat("/proc/self/ns/mnt").st_ino
+          host_cwd = os.getcwd()
+          sentinel = ROOT / "host-sentinel.bin"
+          sentinel.write_bytes(b"host-only")
+          sentinel_fd = sentinel.open("rb")
+          host_fd = sentinel_fd.fileno()
+          uid, gid = os.getuid(), os.getgid()
+
+          def inspect_container(name, mounts, expected_image=None, expected_command=None):
+              inspect = json.loads(run(["docker", "inspect", name]))[0]
+              config = inspect["HostConfig"]
+              container_id = inspect.get("Id", "")
+              container_name = inspect.get("Name", "")
+              if not re.fullmatch(r"[0-9a-f]{64}", container_id) or container_name.lstrip("/") != name:
+                  raise RuntimeError("docker_container_identity_mismatch")
+              if config.get("NetworkMode") != "none" or not config.get("ReadonlyRootfs") or config.get("Privileged"):
+                  raise RuntimeError("docker_security_config_mismatch")
+              if "ALL" not in (config.get("CapDrop") or []) or not any("no-new-privileges" in item for item in (config.get("SecurityOpt") or [])):
+                  raise RuntimeError("docker_privilege_config_mismatch")
+              if str(inspect["Config"].get("User", "")).split(":", 1)[0] in {"", "0", "root"}:
+                  raise RuntimeError("docker_user_is_root")
+              if expected_image is not None and inspect["Config"].get("Image") != expected_image:
+                  raise RuntimeError("docker_image_reference_mismatch")
+              if expected_command is not None and inspect["Config"].get("Cmd") != expected_command:
+                  raise RuntimeError("docker_command_mismatch")
+              if config.get("PidMode") == "host" or config.get("IpcMode") == "host":
+                  raise RuntimeError("host_namespace_shared")
+              observed = {row["Destination"]: (Path(row["Source"]).resolve(), not row["RW"]) for row in inspect["Mounts"]}
+              expected = {target: (host.resolve(), readonly) for host, target, readonly in mounts}
+              forbidden_targets = {"/proc", "/host" + "/proc", "/var/run" + "/docker.sock"}
+              if observed != expected or any(target in forbidden_targets for target in observed):
+                  raise RuntimeError("docker_mount_set_mismatch")
+              build_label = name.removeprefix("phase83-").removesuffix("-wheel")
+              if build_label not in {"build-1", "build-2"}:
+                  raise RuntimeError("docker_build_label_invalid")
+              source_labels = {"/input": "input", "/toolchain": "toolchain", "/work": "work/" + build_label,
+                               "/out": "out/" + build_label}
+              return {"network_mode": config["NetworkMode"], "readonly_rootfs": config["ReadonlyRootfs"],
+                      "cap_drop": config["CapDrop"], "security_opt": config["SecurityOpt"],
+                      "user": inspect["Config"]["User"], "pid_mode": config.get("PidMode", ""),
+                      "ipc_mode": config.get("IpcMode", ""), "privileged": config.get("Privileged", False),
+                      "container_id": container_id, "container_name": container_name,
+                      "image_reference": inspect["Config"].get("Image"),
+                      "mounts": [{"source": source_labels[target], "target": target, "read_only": readonly}
+                                  for target, (_source, readonly) in sorted(observed.items())]}
+
+          def create_start_wait(name, command, mounts, expected_image=None, expected_command=None):
+              created_id = run(command).strip()
+              if not re.fullmatch(r"[0-9a-f]{64}", created_id):
+                  raise RuntimeError("docker_create_id_invalid")
+              try:
+                  result = inspect_container(name, mounts, expected_image, expected_command)
+                  if result["container_id"] != created_id:
+                      raise RuntimeError("docker_created_inspected_id_mismatch")
+                  run(["docker", "start", name])
+                  code = int(run(["docker", "wait", name]).strip())
+                  logs = run(["docker", "logs", name])
+                  if code:
+                      raise RuntimeError(f"container_failed:{name}:{logs[-1200:]}")
+                  return result, logs
+              finally:
+                  run(["docker", "rm", name])
+
+          def build_container_command(name, image, uid, gid, mounts, host_probe_args, epoch, source_sha256):
+              command = ["docker", "create", "--name", name, "--network=none", "--read-only", "--cap-drop=ALL",
+                         "--security-opt=no-new-privileges", "--user", f"{uid}:{gid}", "--workdir=/work"]
+              for host_path, target, readonly in mounts:
+                  option = ",readonly" if readonly else ""
+                  command += ["--mount", f"type=bind,source={host_path},target={target}{option}"]
+              command += ["--env", f"SOURCE_DATE_EPOCH={epoch}", "--env", "PHASE83_SOURCE_SHA256=" + source_sha256,
+                  "--env", "PIP_CONFIG_FILE=/dev/null", "--env", "PIP_NO_INDEX=1", "--env", "PIP_DISABLE_PIP_VERSION_CHECK=1",
+                  "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "PYTHONNOUSERSITE=1", "--env", "HOME=/work/home", "--env", "TMPDIR=/work/tmp",
+                  image, "/toolchain/venv/bin/python", "/input/trusted-build-wrapper.py", name, *host_probe_args, "--",
+                  "/toolchain/venv/bin/python", "-m", "pip", "wheel", "--no-deps", "--no-index", "--no-cache-dir",
+                  "--disable-pip-version-check", "--no-build-isolation", "--wheel-dir=/out", "/input/ofxparse-0.21.tar.gz"]
+              return command
+
+          def wheel_evidence(payload):
+              filename = "ofxparse-0.21-py3-none-any.whl"
+              if not isinstance(payload, bytes) or not payload or len(payload) > MAX_WHEEL_BYTES:
+                  raise RuntimeError("wheel_evidence_bytes_not_validated")
+              try:
+                  archive = zipfile.ZipFile(io.BytesIO(payload), mode="r")
+              except (OSError, zipfile.BadZipFile) as error:
+                  raise RuntimeError("wheel_zip_invalid") from error
+              with archive:
+                  members = archive.infolist()
+                  if not members or len(members) > MAX_WHEEL_MEMBERS:
+                      raise RuntimeError("wheel_member_count_out_of_range")
+                  seen, regular, total_size = set(), set(), 0
+                  for member in members:
+                      name = member.filename
+                      if not name or "\\" in name or name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+                          raise RuntimeError("unsafe_wheel_path")
+                      path_text = name[:-1] if name.endswith("/") else name
+                      parts = path_text.split("/")
+                      if any(part in {"", ".", ".."} for part in parts) or "/".join(parts) != path_text:
+                          raise RuntimeError("unsafe_wheel_path")
+                      normalized = path_text.casefold()
+                      if normalized in seen:
+                          raise RuntimeError("duplicate_wheel_path")
+                      seen.add(normalized)
+                      file_type = stat.S_IFMT(member.external_attr >> 16)
+                      if member.is_dir():
+                          if file_type not in {0, stat.S_IFDIR}:
+                              raise RuntimeError("unsafe_wheel_member_type")
+                          continue
+                      if file_type not in {0, stat.S_IFREG}:
+                          raise RuntimeError("unsafe_wheel_member_type")
+                      if member.file_size < 0 or member.file_size > MAX_WHEEL_UNCOMPRESSED_BYTES:
+                          raise RuntimeError("wheel_member_size_out_of_range")
+                      total_size += member.file_size
+                      if total_size > MAX_WHEEL_UNCOMPRESSED_BYTES:
+                          raise RuntimeError("wheel_total_size_out_of_range")
+                      regular.add(path_text)
+                  metadata_path = "ofxparse-0.21.dist-info/METADATA"
+                  wheel_path = "ofxparse-0.21.dist-info/WHEEL"
+                  required = {"ofxparse/__init__.py", metadata_path, wheel_path, "ofxparse-0.21.dist-info/RECORD"}
+                  if not required.issubset(regular):
+                      raise RuntimeError("wheel_required_member_missing")
+                  metadata_text = archive.read(metadata_path).decode("utf-8")
+                  wheel_text = archive.read(wheel_path).decode("utf-8")
+                  if archive.testzip() is not None:
+                      raise RuntimeError("wheel_crc_mismatch")
+                  metadata = {key.strip().casefold(): value.strip() for line in metadata_text.splitlines()
+                              if ":" in line for key, value in [line.split(":", 1)]}
+                  wheel = {key.strip().casefold(): value.strip().casefold() for line in wheel_text.splitlines()
+                           if ":" in line for key, value in [line.split(":", 1)]}
+                  normalized_name = re.sub(r"[-_.]+", "-", metadata.get("name", "")).casefold()
+                  if normalized_name != "ofxparse" or metadata.get("version") != "0.21":
+                      raise RuntimeError("wheel_package_identity_mismatch")
+                  if wheel.get("root-is-purelib") != "true" or wheel.get("tag") != "py3-none-any":
+                      raise RuntimeError("wheel_tag_or_purelib_mismatch")
+              return {"filename": filename, "tag": "py3-none-any", "size": len(payload),
+                      "sha256": hashlib.sha256(payload).hexdigest(), "cache_path": ".cache/phase83/ofxparse/0.21/wheels"}
+
+          controls = {
+              "schema_version": 3, "provider": "github_actions_docker_public_release", "status": "verified",
+              "source_sha256": source_before,
+              "github": {"run_id": int(raw_run_id), "sha": github_sha,
+                         "ref": github_ref, "workflow_ref": github_workflow_ref},
+              "workflow": {"path": ".github/workflows/phase83-ofxparse-wheel.yml"},
+              "runner": {"os": runner_os, "image_os": runner_image_os,
+                         "image_version": runner_image_version, "docker_server_version": docker_server_version},
+              "image": {"tag": IMAGE_TAG, "reference": image, "digest": image_digest},
+              "build_dependencies": tools_evidence,
+              "source_date_epoch": {"value": EPOCH, "basis": "fixed recipe policy input"},
+              "probes": [],
+          }
+          if controls["github"]["ref"] != "refs/heads/main" or len(controls["github"]["sha"]) != 40:
+              raise RuntimeError("unexpected_workflow_ref_or_commit")
+          controls["runtime_identity"] = {
+              "provider": "github_actions_docker_public_release", "repository": github_repository,
+              "run_id": controls["github"]["run_id"], "commit_sha": controls["github"]["sha"],
+              "workflow_path": controls["workflow"]["path"], "workflow_ref": controls["github"]["workflow_ref"],
+              "runner": controls["runner"], "image_digest": image_digest,
+          }
+
+          validated_wheels = {}
+          try:
+              for index in (1, 2):
+                  label = f"build-{index}"
+                  work_dir, output_dir = WORK / label, OUT / label
+                  work_dir.mkdir(parents=True, exist_ok=True)
+                  output_dir.mkdir(parents=True, exist_ok=True)
+                  (work_dir / "home").mkdir()
+                  (work_dir / "tmp").mkdir()
+                  container_name = f"phase83-{label}-wheel"
+                  build_mounts = [(INPUT, "/input", True), (TOOLS, "/toolchain", True),
+                                  (work_dir, "/work", False), (output_dir, "/out", False)]
+                  host_probe_args = [str(os.getpid()), str(host_pid_ns), str(host_mnt_ns), str(host_fd), host_cwd, str(sentinel)]
+                  command = build_container_command(container_name, image, uid, gid, build_mounts,
+                                                    host_probe_args, EPOCH, source_before)
+                  expected_command = command[command.index(image) + 1:]
+                  build_container, build_logs = create_start_wait(
+                      container_name, command, build_mounts, image, expected_command)
+                  log_lines = build_logs.splitlines()
+                  if not log_lines:
+                      raise RuntimeError("trusted_probe_metadata_missing")
+                  probe_result = json.loads(log_lines[0])
+                  if (probe_result.get("source_sha256") != source_before
+                          or probe_result.get("container_name") != container_name
+                          or probe_result.get("phase") != "before_backend_exec"
+                          or not isinstance(probe_result.get("process_pid"), int)
+                          or isinstance(probe_result.get("process_pid"), bool)
+                          or probe_result["process_pid"] <= 0):
+                      raise RuntimeError("trusted_probe_metadata_binding_invalid")
+                  probe_result["container_config_verified"] = "passed"
+                  if any(probe_result.get(key) not in {"passed", "clean"} for key in EXPECTED_PROBES if key != "source_unchanged"):
+                      raise RuntimeError(f"container_gate_failed:{label}")
+                  if sha256(INPUT / SOURCE["name"]) != source_before:
+                      raise RuntimeError(f"source_changed_after_build:{label}")
+                  probe_result["source_unchanged"] = "passed"
+                  wheel_bytes = read_verified_wheel_directory(output_dir, "ofxparse-0.21-py3-none-any.whl")
+                  validated_wheels[index] = wheel_bytes
+                  controls["probes"].append({"label": label, "container_id": build_container["container_id"],
+                      "container_name": container_name, "container": build_container, "results": probe_result,
+                      "build_container_inspected_before_start": True, "build_container": build_container})
+
+              first_bytes, second_bytes = validated_wheels[1], validated_wheels[2]
+              if first_bytes != second_bytes:
+                  raise RuntimeError("wheel_builds_not_byte_identical")
+              if sha256(INPUT / SOURCE["name"]) != source_before:
+                  raise RuntimeError("source_changed_during_build")
+              ARTIFACT.mkdir(parents=True, exist_ok=True)
+              (ARTIFACT / "build-1").mkdir(parents=True, exist_ok=True)
+              (ARTIFACT / "build-1" / "ofxparse-0.21-py3-none-any.whl").write_bytes(first_bytes)
+              (ARTIFACT / "build-2").mkdir(parents=True, exist_ok=True)
+              (ARTIFACT / "build-2" / "ofxparse-0.21-py3-none-any.whl").write_bytes(second_bytes)
+              controls_bytes = json.dumps(controls, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+              (ARTIFACT / "controls.json").write_bytes(controls_bytes)
+              evidence = {
+                  "schema_version": 3, "provider": "github_actions_docker_public_release", "status": "verified",
+                  "package": "ofxparse", "version": "0.21", "source_sha256": source_before,
+                  "artifact_controls_sha256": hashlib.sha256(controls_bytes).hexdigest(),
+                  "github": controls["github"], "workflow": controls["workflow"],
+                  "runtime_identity": controls["runtime_identity"],
+                  "runner": controls["runner"], "image": controls["image"],
+                  "build_dependencies": tools_evidence,
+                  "build": {"python_version": setup_result["python"], "source_date_epoch": EPOCH,
+                             "toolchain": tools_evidence,
+                             "command": ["/toolchain/venv/bin/python", "-m", "pip", "wheel", "--no-deps", "--no-index", "--no-cache-dir",
+                                        "--disable-pip-version-check", "--no-build-isolation", "--wheel-dir=/out", "/input/ofxparse-0.21.tar.gz"],
+                            "outputs": [{"label": f"build-{i}", "filename": f"ofxparse-0.21-py3-none-any.whl",
+                                         "size": len(data), "sha256": hashlib.sha256(data).hexdigest()} for i, data in ((1, first_bytes), (2, second_bytes))],
+                            "byte_identical": True},
+                  "wheel": wheel_evidence(first_bytes),
+                  "artifact_name": "phase83-ofxparse-public-build", "binary_committed": False,
+              }
+              (ARTIFACT / "evidence.json").write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+              validate_artifact_tree(ARTIFACT, {
+                  "build-1/ofxparse-0.21-py3-none-any.whl", "build-2/ofxparse-0.21-py3-none-any.whl",
+                  "controls.json", "evidence.json",
+              })
+              member_names = (
+                  "build-1/ofxparse-0.21-py3-none-any.whl",
+                  "build-2/ofxparse-0.21-py3-none-any.whl",
+                  "controls.json",
+                  "evidence.json",
+              )
+              bundle_stream = io.BytesIO()
+              with zipfile.ZipFile(bundle_stream, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
+                  for member_name in member_names:
+                      info = zipfile.ZipInfo(member_name, date_time=(1980, 1, 1, 0, 0, 0))
+                      info.compress_type = zipfile.ZIP_DEFLATED
+                      info.create_system = 3
+                      info.external_attr = (stat.S_IFREG | 0o644) << 16
+                      bundle.writestr(info, (ARTIFACT / member_name).read_bytes())
+              bundle_bytes = bundle_stream.getvalue()
+              if not bundle_bytes or len(bundle_bytes) > BUNDLE_MAX_BYTES:
+                  raise RuntimeError("public_bundle_size_invalid")
+              with zipfile.ZipFile(io.BytesIO(bundle_bytes), "r") as bundle:
+                  if bundle.namelist() != list(member_names) or bundle.testzip() is not None:
+                      raise RuntimeError("public_bundle_validation_failed")
+                  if bundle.read(member_names[0]) != bundle.read(member_names[1]):
+                      raise RuntimeError("public_bundle_wheels_not_byte_identical")
+              bundle_sha256 = hashlib.sha256(bundle_bytes).hexdigest()
+              bundle_size = len(bundle_bytes)
+              encoded_bundle = base64.b64encode(bundle_bytes).decode("ascii")
+              encoded_chunks = [encoded_bundle[offset:offset + BUNDLE_CHUNK_BYTES]
+                                for offset in range(0, len(encoded_bundle), BUNDLE_CHUNK_BYTES)]
+              if not 1 <= len(encoded_chunks) <= BUNDLE_CHUNK_COUNT:
+                  raise RuntimeError("public_bundle_chunk_count_invalid")
+              output_values = {
+                  "bundle_chunk_count": str(len(encoded_chunks)),
+                  "bundle_sha256": bundle_sha256,
+                  "bundle_size": str(bundle_size),
+              }
+              for index in range(BUNDLE_CHUNK_COUNT):
+                  output_values[f"bundle_b64_{index}"] = encoded_chunks[index] if index < len(encoded_chunks) else ""
+              utf16_bytes = validate_output_budget(output_values)
+              validate_bundle_output(output_values, bundle_bytes)
+              output_path = Path(os.environ["GITHUB_OUTPUT"])
+              with output_path.open("a", encoding="ascii", newline="\n") as output:
+                  for name in ("bundle_chunk_count", "bundle_sha256", "bundle_size",
+                               *(f"bundle_b64_{index}" for index in range(BUNDLE_CHUNK_COUNT))):
+                      output.write(name + "=" + output_values[name] + "\n")
+              print(json.dumps({"status": "verified", "image_digest": image_digest,
+                                "source_sha256": source_before, "wheel_sha256": hashlib.sha256(first_bytes).hexdigest(),
+                                "github_run_id": controls["github"]["run_id"], "github_sha": controls["github"]["sha"],
+                                "bundle_sha256": bundle_sha256, "bundle_size": bundle_size,
+                                "bundle_chunk_count": len(encoded_chunks), "job_output_utf16_bytes": utf16_bytes}, sort_keys=True))
+          finally:
+              sentinel_fd.close()
+              sentinel.unlink(missing_ok=True)
+          PY
+
+  publish-draft:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Validate bundle and create one unpublished draft release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUNDLE_CHUNK_COUNT: ${{ needs.build.outputs.bundle_chunk_count }}
+          BUNDLE_SHA256: ${{ needs.build.outputs.bundle_sha256 }}
+          BUNDLE_SIZE: ${{ needs.build.outputs.bundle_size }}
+          BUNDLE_B64_0: ${{ needs.build.outputs.bundle_b64_0 }}
+          BUNDLE_B64_1: ${{ needs.build.outputs.bundle_b64_1 }}
+          BUNDLE_B64_2: ${{ needs.build.outputs.bundle_b64_2 }}
+          BUNDLE_B64_3: ${{ needs.build.outputs.bundle_b64_3 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import email.parser
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import stat
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import zipfile
+
+          REPOSITORY = "Tagliarus/ofxparse-0.21-reproducible-wheel"
+          WORKFLOW_PATH = ".github/workflows/phase83-ofxparse-wheel.yml"
+          MAX_BUNDLE_BYTES = 196608
+          BUNDLE_CHUNK_BYTES = 65536
+          BUNDLE_CHUNK_COUNT = 4
+          GITHUB_ENV_STRING_LIMIT_BYTES = 131072
+          GITHUB_JOB_OUTPUT_LIMIT_BYTES = 1000000
+          GITHUB_JOB_OUTPUT_RESERVE_BYTES = 8192
+          API_RELEASE_ORIGIN = "https://api.github.com"
+          API_UPLOAD_ORIGIN = "https://uploads.github.com"
+          SOURCE = {"filename": "ofxparse-0.21.tar.gz", "size": 53837,
+                    "sha256": "057ab68d31270dece4d1a47662096aa76341968aaee145ffc711cb44cbd5c4a7"}
+          SOURCE_DATE_EPOCH = 1783123200
+          EXPECTED_TOOLS = [
+              {"name": "pip", "version": "26.3", "filename": "pip-26.3-py3-none-any.whl", "size": 1950951,
+               "sha256": "f3b60b20ffaadd4415ed7957212a38ac63fa4c5fa375bd0f4a797777940fad13",
+               "url": "https://files.pythonhosted.org/packages/07/25/ee8c38ae72d66b844ce8eb9711ba905dba21ca1a8a0c960057c41cd23337/pip-26.3-py3-none-any.whl", "bytes_verified": True},
+              {"name": "setuptools", "version": "84.2.1", "filename": "setuptools-84.2.1-py3-none-any.whl", "size": 876263,
+               "sha256": "ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2",
+               "url": "https://files.pythonhosted.org/packages/ef/55/6dc6d6bb953bdfc52519a0059592c52b6e3b8ad51cf8256dffceb55b0610/setuptools-84.2.1-py3-none-any.whl", "bytes_verified": True},
+          ]
+          EXPECTED_PROBES = (
+              "container_config_verified", "uid_non_root", "capabilities_zero", "no_new_privs",
+              "readonly_rootfs", "input_readonly", "runtime_readonly", "toolchain_readonly",
+              "work_write", "out_write", "loopback_positive", "external_tcp_parent_denied",
+              "external_tcp_child_denied", "input_write_denied", "input_chmod_denied",
+              "runtime_write_denied", "runtime_chmod_denied", "toolchain_write_denied",
+              "toolchain_chmod_denied", "host_cwd_inaccessible", "host_sentinel_inaccessible",
+              "host_fd_inaccessible", "private_pid_namespace", "private_mount_namespace",
+              "docker_socket_absent", "host_proc_absent", "pip_check", "source_unchanged",
+          )
+
+          def fail(reason):
+              raise RuntimeError(reason)
+
+          def validate_wheel_bytes(payload):
+              if not payload or len(payload) > 2 * 1024 * 1024:
+                  fail("public_bundle_wheel_size_invalid")
+              try:
+                  archive = zipfile.ZipFile(io.BytesIO(payload), "r")
+              except (OSError, zipfile.BadZipFile):
+                  fail("public_bundle_wheel_zip_invalid")
+              with archive:
+                  rows = archive.infolist()
+                  if not rows or len(rows) > 512:
+                      fail("public_bundle_wheel_member_count_invalid")
+                  names = set()
+                  regular = set()
+                  total = 0
+                  for row in rows:
+                      name = row.filename
+                      parts = name[:-1].split("/") if name.endswith("/") else name.split("/")
+                      mode = stat.S_IFMT(row.external_attr >> 16)
+                      if (not name or "\\" in name or name.startswith("/") or re.match(r"^[A-Za-z]:", name)
+                              or any(part in {"", ".", ".."} for part in parts) or name in names):
+                          fail("public_bundle_wheel_path_invalid")
+                      names.add(name)
+                      if row.is_dir():
+                          if mode not in {0, stat.S_IFDIR}:
+                              fail("public_bundle_wheel_member_type_invalid")
+                          continue
+                      if mode not in {0, stat.S_IFREG} or row.file_size < 0 or row.file_size > 5 * 1024 * 1024:
+                          fail("public_bundle_wheel_member_type_or_size_invalid")
+                      total += row.file_size
+                      if total > 5 * 1024 * 1024:
+                          fail("public_bundle_wheel_total_size_invalid")
+                      regular.add(name)
+                  if archive.testzip() is not None:
+                      fail("public_bundle_wheel_crc_mismatch")
+                  required = {"ofxparse/__init__.py", "ofxparse-0.21.dist-info/METADATA",
+                              "ofxparse-0.21.dist-info/WHEEL", "ofxparse-0.21.dist-info/RECORD"}
+                  if not required.issubset(regular):
+                      fail("public_bundle_wheel_required_member_missing")
+                  metadata = email.parser.Parser().parsestr(archive.read("ofxparse-0.21.dist-info/METADATA").decode("utf-8"))
+                  wheel_lines = archive.read("ofxparse-0.21.dist-info/WHEEL").decode("utf-8").splitlines()
+              wheel_headers = {key.strip().casefold(): value.strip().casefold()
+                               for line in wheel_lines if ":" in line for key, value in [line.split(":", 1)]}
+              normalized = re.sub(r"[-_.]+", "-", str(metadata.get("Name", ""))).casefold()
+              if normalized != "ofxparse" or metadata.get("Version") != "0.21":
+                  fail("public_bundle_wheel_package_identity_invalid")
+              if wheel_headers.get("root-is-purelib") != "true" or wheel_headers.get("tag") != "py3-none-any":
+                  fail("public_bundle_wheel_tag_invalid")
+              return {"filename": "ofxparse-0.21-py3-none-any.whl", "tag": "py3-none-any",
+                      "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+
+          def validate_controls_and_evidence(controls_bytes, evidence_bytes, controls, evidence, first, second, run_id, commit):
+              identity = controls.get("runtime_identity")
+              github = controls.get("github")
+              workflow = controls.get("workflow")
+              runner = controls.get("runner")
+              image = controls.get("image")
+              if (controls_bytes != json.dumps(controls, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                      or controls.get("schema_version") != 3 or controls.get("provider") != "github_actions_docker_public_release"
+                      or controls.get("status") != "verified" or controls.get("source_sha256") != SOURCE["sha256"]
+                      or controls.get("build_dependencies") != EXPECTED_TOOLS
+                      or controls.get("source_date_epoch") != {"value": SOURCE_DATE_EPOCH, "basis": "fixed recipe policy input"}
+                      or not isinstance(identity, dict) or not isinstance(github, dict) or not isinstance(workflow, dict)
+                      or not isinstance(runner, dict) or not isinstance(image, dict)
+                      or identity.get("provider") != "github_actions_docker_public_release"
+                      or identity.get("repository") != REPOSITORY or identity.get("run_id") != int(run_id)
+                      or identity.get("commit_sha") != commit or identity.get("workflow_path") != WORKFLOW_PATH
+                      or identity.get("workflow_ref") != REPOSITORY + "/" + WORKFLOW_PATH + "@refs/heads/main"
+                      or identity.get("workflow_ref") != github.get("workflow_ref")
+                      or identity.get("commit_sha") != github.get("sha") or identity.get("run_id") != github.get("run_id")
+                      or github.get("ref") != "refs/heads/main" or workflow.get("path") != WORKFLOW_PATH
+                      or identity.get("runner") != runner or runner.get("os") != "Linux"
+                      or not all(isinstance(runner.get(key), str) and runner[key].strip() for key in ("image_os", "image_version", "docker_server_version"))
+                      or image.get("tag") != "python:3.11.9-slim-bookworm"
+                      or image.get("reference") != "python@" + str(identity.get("image_digest"))
+                      or image.get("digest") != identity.get("image_digest")
+                      or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(identity.get("image_digest", "")))):
+                  fail("public_bundle_controls_identity_or_pins_invalid")
+              probes = controls.get("probes")
+              if not isinstance(probes, list) or len(probes) != 2:
+                  fail("public_bundle_probe_count_invalid")
+              for label, probe in zip(("build-1", "build-2"), probes):
+                  if (not isinstance(probe, dict) or probe.get("label") != label
+                          or not isinstance(probe.get("container_id"), str)
+                          or not re.fullmatch(r"[0-9a-f]{64}", probe["container_id"])
+                          or probe.get("build_container_inspected_before_start") is not True
+                          or probe.get("container") != probe.get("build_container")
+                          or probe.get("container", {}).get("container_id") != probe.get("container_id")):
+                      fail("public_bundle_probe_container_binding_invalid")
+                  container = probe["container"]
+                  if (container.get("network_mode") != "none" or container.get("readonly_rootfs") is not True
+                          or container.get("cap_drop") != ["ALL"] or "no-new-privileges" not in container.get("security_opt", [])
+                          or container.get("privileged") is not False
+                          or str(container.get("user", "")).split(":", 1)[0] in {"", "0", "root"}
+                          or container.get("pid_mode") == "host" or container.get("ipc_mode") == "host"
+                          or container.get("image_reference") != image.get("reference")
+                          or container.get("container_name") != "/phase83-" + label + "-wheel"):
+                      fail("public_bundle_probe_container_config_invalid")
+                  expected_mounts = {
+                      ("input", "/input", True), ("toolchain", "/toolchain", True),
+                      ("work/" + label, "/work", False), ("out/" + label, "/out", False),
+                  }
+                  mounts = container.get("mounts")
+                  if not isinstance(mounts, list) or {
+                      (mount.get("source"), mount.get("target"), mount.get("read_only"))
+                      for mount in mounts if isinstance(mount, dict)
+                  } != expected_mounts:
+                      fail("public_bundle_probe_mounts_invalid")
+                  if len(mounts) != len(expected_mounts) or any(not isinstance(mount, dict) for mount in mounts):
+                      fail("public_bundle_probe_mounts_invalid")
+                  results = probe.get("results")
+                  if not isinstance(results, dict) or any(
+                      results.get(key) != ("clean" if key == "pip_check" else "passed") for key in EXPECTED_PROBES
+                  ):
+                      fail("public_bundle_probe_results_invalid")
+              if (evidence.get("schema_version") != 3 or evidence.get("provider") != "github_actions_docker_public_release"
+                      or evidence.get("status") != "verified" or evidence.get("package") != "ofxparse"
+                      or evidence.get("version") != "0.21" or evidence.get("source_sha256") != SOURCE["sha256"]
+                      or evidence.get("artifact_controls_sha256") != hashlib.sha256(controls_bytes).hexdigest()
+                      or evidence.get("runtime_identity") != identity or evidence.get("github") != github
+                      or evidence.get("workflow") != workflow or evidence.get("runner") != runner
+                      or evidence.get("image") != image or evidence.get("build_dependencies") != EXPECTED_TOOLS
+                      or evidence.get("binary_committed") is not False
+                      or any(key in evidence for key in ("source_audit_sha256", "bundle_sha256", "zip_sha256", "artifact_zip_sha256"))):
+                  fail("public_bundle_evidence_provenance_invalid")
+              build = evidence.get("build")
+              if (not isinstance(build, dict) or build.get("python_version") != "3.11.9"
+                      or build.get("source_date_epoch") != SOURCE_DATE_EPOCH
+                      or build.get("toolchain") != EXPECTED_TOOLS or build.get("byte_identical") is not True):
+                  fail("public_bundle_build_evidence_invalid")
+              command = build.get("command")
+              if (not isinstance(command, list) or not all(isinstance(part, str) for part in command)
+                      or command.count("wheel") != 1
+                      or any(value not in command for value in ("--no-deps", "--no-index", "--no-build-isolation", "--wheel-dir=/out", "/input/ofxparse-0.21.tar.gz"))):
+                  fail("public_bundle_build_command_invalid")
+              wheel_info = validate_wheel_bytes(first)
+              outputs = build.get("outputs")
+              if not isinstance(outputs, list) or len(outputs) != 2:
+                  fail("public_bundle_build_outputs_invalid")
+              for label, row in zip(("build-1", "build-2"), outputs):
+                  if not isinstance(row, dict) or row.get("label") != label or any(
+                      row.get(key) != wheel_info[key] for key in ("filename", "size", "sha256")
+                  ):
+                      fail("public_bundle_build_output_hash_invalid")
+              wheel_report = evidence.get("wheel")
+              if not isinstance(wheel_report, dict) or any(
+                  wheel_report.get(key) != wheel_info[key] for key in ("filename", "tag", "size", "sha256")
+              ) or wheel_report.get("cache_path") != ".cache/phase83/ofxparse/0.21/wheels":
+                  fail("public_bundle_wheel_evidence_invalid")
+
+          def validate_output_budget(values):
+              utf16_bytes = 0
+              for name, value in values.items():
+                  if not isinstance(name, str) or not name.isascii() or not isinstance(value, str) or not value.isascii():
+                      fail("public_release_output_not_ascii")
+                  if len((name + "=" + value).encode("ascii")) >= GITHUB_ENV_STRING_LIMIT_BYTES:
+                      fail("public_release_output_value_limit_exceeded")
+                  utf16_bytes += len((name + "=" + value + "\n").encode("utf-16-le"))
+              if utf16_bytes + GITHUB_JOB_OUTPUT_RESERVE_BYTES >= GITHUB_JOB_OUTPUT_LIMIT_BYTES:
+                  fail("public_release_job_output_limit_exceeded")
+              return utf16_bytes
+
+          def validate_bundle_chunks(values):
+              expected_names = {
+                  "BUNDLE_CHUNK_COUNT", "BUNDLE_SIZE", "BUNDLE_SHA256",
+                  *(f"BUNDLE_B64_{index}" for index in range(BUNDLE_CHUNK_COUNT)),
+              }
+              if not isinstance(values, dict) or set(values) != expected_names:
+                  fail("public_release_bundle_chunk_fields_invalid")
+              validate_output_budget(values)
+              count_text = values["BUNDLE_CHUNK_COUNT"]
+              size_text = values["BUNDLE_SIZE"]
+              expected_sha = values["BUNDLE_SHA256"]
+              if not isinstance(count_text, str) or not re.fullmatch(r"[1-4]", count_text):
+                  fail("public_release_bundle_chunk_count_invalid")
+              if (not isinstance(size_text, str) or not re.fullmatch(r"[1-9][0-9]{0,5}", size_text)
+                      or int(size_text) > MAX_BUNDLE_BYTES):
+                  fail("public_release_bundle_size_invalid")
+              if not isinstance(expected_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+                  fail("public_release_bundle_sha256_invalid")
+              count = int(count_text)
+              pieces = []
+              for index in range(BUNDLE_CHUNK_COUNT):
+                  chunk = values[f"BUNDLE_B64_{index}"]
+                  if not isinstance(chunk, str) or not chunk.isascii() or any(character.isspace() for character in chunk):
+                      fail("public_release_bundle_chunk_invalid")
+                  if len(chunk) > BUNDLE_CHUNK_BYTES:
+                      fail("public_release_bundle_chunk_size_invalid")
+                  if index < count:
+                      if not chunk:
+                          fail("public_release_bundle_chunk_missing")
+                      pieces.append(chunk)
+                  elif chunk:
+                      fail("public_release_bundle_trailing_chunk_nonempty")
+              encoded = "".join(pieces)
+              try:
+                  payload = base64.b64decode(encoded, validate=True)
+              except (ValueError, base64.binascii.Error):
+                  fail("public_release_bundle_base64_invalid")
+              if base64.b64encode(payload).decode("ascii") != encoded:
+                  fail("public_release_bundle_base64_noncanonical")
+              if not payload or len(payload) > MAX_BUNDLE_BYTES or len(payload) != int(size_text):
+                  fail("public_release_bundle_size_mismatch")
+              if hashlib.sha256(payload).hexdigest() != expected_sha:
+                  fail("public_release_bundle_sha256_mismatch")
+              return payload
+
+          def pinned_post(url, data, headers, *, expected_origin, expected_path, expected_query="", timeout=30):
+              parsed = urllib.parse.urlsplit(url)
+              expected = urllib.parse.urlsplit(expected_origin)
+              origin = parsed.scheme + "://" + parsed.netloc
+              if (origin != expected_origin or parsed.scheme != expected.scheme or parsed.netloc != expected.netloc
+                      or expected.scheme not in {"https", "http"} or expected.path or expected.query
+                      or parsed.path != expected_path or parsed.query != expected_query or parsed.fragment
+                      or parsed.username is not None or parsed.password is not None
+                      or (parsed.scheme == "https" and parsed.port not in {None, 443})
+                      or (parsed.scheme == "http" and parsed.port is None)):
+                  fail("github_release_post_endpoint_not_pinned")
+              request = urllib.request.Request(url, data=data, method="POST", headers=headers)
+
+              class RejectRedirects(urllib.request.HTTPRedirectHandler):
+                  def redirect_request(self, _request, _fp, _code, _msg, _headers, _newurl):
+                      fail("github_release_redirect_rejected")
+
+              opener = urllib.request.build_opener(RejectRedirects())
+              try:
+                  with opener.open(request, timeout=timeout) as response:
+                      return response.read(256 * 1024)
+              except urllib.error.HTTPError as error:
+                  if 300 <= error.code < 400:
+                      fail("github_release_redirect_rejected")
+                  raise RuntimeError("github_release_http_" + str(error.code)) from None
+
+          def request_json(url, token, value, *, expected_origin, expected_path):
+              body = json.dumps(value, separators=(",", ":")).encode("utf-8")
+              response = pinned_post(url, body, {
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": "Bearer " + token,
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "ofxparse-0.21-reproducible-wheel",
+                  "Content-Type": "application/json",
+              }, expected_origin=expected_origin, expected_path=expected_path)
+              try:
+                  return json.loads(response.decode("utf-8"))
+              except (UnicodeDecodeError, json.JSONDecodeError):
+                  fail("github_release_json_response_invalid")
+
+          def main():
+              repository = os.environ.get("GITHUB_REPOSITORY", "")
+              ref = os.environ.get("GITHUB_REF", "")
+              commit = os.environ.get("GITHUB_SHA", "").casefold()
+              run_id = os.environ.get("GITHUB_RUN_ID", "")
+              attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+              token = os.environ.get("GITHUB_TOKEN", "")
+              expected_sha = os.environ.get("BUNDLE_SHA256", "")
+              raw_size = os.environ.get("BUNDLE_SIZE", "")
+              bundle_values = {
+                  "BUNDLE_CHUNK_COUNT": os.environ.get("BUNDLE_CHUNK_COUNT", ""),
+                  "BUNDLE_SIZE": raw_size,
+                  "BUNDLE_SHA256": expected_sha,
+                  **{f"BUNDLE_B64_{index}": os.environ.get(f"BUNDLE_B64_{index}", "")
+                     for index in range(BUNDLE_CHUNK_COUNT)},
+              }
+              if (repository != REPOSITORY or ref != "refs/heads/main"
+                      or not re.fullmatch(r"[0-9a-f]{40}", commit)
+                      or not re.fullmatch(r"[1-9][0-9]{0,19}", run_id)
+                      or not re.fullmatch(r"[1-9][0-9]{0,5}", attempt)
+                      or not token or not re.fullmatch(r"[0-9a-f]{64}", expected_sha)
+                      or not re.fullmatch(r"[1-9][0-9]{0,5}", raw_size)):
+                  fail("public_release_inputs_invalid")
+              environment_values = {
+                  "GITHUB_TOKEN": token, "GITHUB_REPOSITORY": repository, "GITHUB_REF": ref,
+                  "GITHUB_SHA": commit, "GITHUB_RUN_ID": run_id, "GITHUB_RUN_ATTEMPT": attempt,
+                  **bundle_values,
+              }
+              validate_output_budget(environment_values)
+              payload = validate_bundle_chunks(bundle_values)
+              bundle_sha = hashlib.sha256(payload).hexdigest()
+              expected_members = {
+                  "build-1/ofxparse-0.21-py3-none-any.whl",
+                  "build-2/ofxparse-0.21-py3-none-any.whl",
+                  "controls.json",
+                  "evidence.json",
+              }
+              with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+                  rows = archive.infolist()
+                  if len(rows) != len(expected_members) or {row.filename for row in rows} != expected_members:
+                      fail("public_bundle_member_allowlist_mismatch")
+                  for row in rows:
+                      mode = stat.S_IFMT(row.external_attr >> 16)
+                      if (row.is_dir() or mode not in {0, stat.S_IFREG} or "\\" in row.filename
+                              or row.filename.startswith("/") or ".." in row.filename.split("/")):
+                          fail("public_bundle_unsafe_member")
+                      if row.file_size <= 0 or row.file_size > MAX_BUNDLE_BYTES:
+                          fail("public_bundle_member_size_invalid")
+                  if archive.testzip() is not None:
+                      fail("public_bundle_crc_mismatch")
+                  controls_bytes = archive.read("controls.json")
+                  evidence_bytes = archive.read("evidence.json")
+                  controls = json.loads(controls_bytes.decode("utf-8"))
+                  evidence = json.loads(evidence_bytes.decode("utf-8"))
+                  first = archive.read("build-1/ofxparse-0.21-py3-none-any.whl")
+                  second = archive.read("build-2/ofxparse-0.21-py3-none-any.whl")
+              if first != second:
+                  fail("public_bundle_wheels_not_byte_identical")
+              if evidence_bytes != (json.dumps(evidence, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8"):
+                  fail("public_bundle_evidence_not_canonical_json")
+              validate_controls_and_evidence(controls_bytes, evidence_bytes, controls, evidence, first, second, run_id, commit)
+              tag_name = "phase83-ofxparse-" + run_id + "-" + attempt
+              release_path = "/repos/" + REPOSITORY + "/releases"
+              release = request_json(API_RELEASE_ORIGIN + release_path, token, {
+                  "tag_name": tag_name,
+                  "name": "ofxparse 0.21 reproducible wheel " + run_id + "." + attempt,
+                  "body": "Unpublished draft build bundle SHA-256: " + bundle_sha + "\nRun: " + run_id + " attempt " + attempt,
+                  "draft": True,
+                  "prerelease": False,
+                  "target_commitish": commit,
+              }, expected_origin=API_RELEASE_ORIGIN, expected_path=release_path)
+              release_id = release.get("id")
+              upload_template = release.get("upload_url", "")
+              target_commitish = release.get("target_commitish")
+              if (not isinstance(release_id, int) or isinstance(release_id, bool) or release_id <= 0
+                      or release.get("draft") is not True or release.get("prerelease") is not False
+                      or release.get("tag_name") != tag_name or target_commitish != commit
+                      or not isinstance(upload_template, str)):
+                  fail("public_draft_release_response_invalid")
+              upload_url = upload_template.split("{", 1)[0]
+              parsed = urllib.parse.urlsplit(upload_url)
+              expected_path = "/repos/" + REPOSITORY + "/releases/" + str(release_id) + "/assets"
+              if parsed.scheme != "https" or parsed.netloc != "uploads.github.com" or parsed.path != expected_path or parsed.query:
+                  fail("public_release_upload_url_invalid")
+              asset_url = upload_url + "?" + urllib.parse.urlencode({"name": "phase83-ofxparse-build.zip"})
+              asset_bytes = pinned_post(asset_url, payload, {
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": "Bearer " + token,
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "Content-Type": "application/zip",
+                  "User-Agent": "ofxparse-0.21-reproducible-wheel",
+              }, expected_origin=API_UPLOAD_ORIGIN, expected_path=expected_path,
+                 expected_query="name=phase83-ofxparse-build.zip", timeout=60)
+              try:
+                  asset = json.loads(asset_bytes.decode("utf-8"))
+              except (UnicodeDecodeError, json.JSONDecodeError):
+                  fail("github_release_asset_response_invalid")
+              if (not isinstance(asset.get("id"), int) or isinstance(asset.get("id"), bool) or asset.get("id") <= 0
+                      or asset.get("name") != "phase83-ofxparse-build.zip" or asset.get("size") != len(payload)
+                      or asset.get("state") != "uploaded"):
+                  fail("public_release_asset_response_invalid")
+              summary = {"status": "draft_asset_uploaded", "repository": REPOSITORY, "run_id": int(run_id),
+                         "commit_sha": commit, "release_id": release_id, "asset_id": asset["id"],
+                         "bundle_sha256": bundle_sha, "bundle_size": len(payload)}
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
+                  stream.write("## ofxparse 0.21 draft bundle\n\n")
+                  stream.write("Repository: " + REPOSITORY + "\n")
+                  stream.write("Run: " + run_id + " / attempt " + attempt + "\n")
+                  stream.write("Release ID: " + str(release_id) + "; asset ID: " + str(asset["id"]) + "\n")
+                  stream.write("ZIP SHA-256: " + bundle_sha + "; bytes: " + str(len(payload)) + "\n")
+              print(json.dumps(summary, sort_keys=True))
+
+          main()
+          PY
